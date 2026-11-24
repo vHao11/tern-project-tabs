@@ -1,0 +1,7 @@
+schema = 1
+id = "project-tabs"
+name = "Project Tabs"
+version = "1.7.0"
+description = "按项目管理标签，恢复、归档和清理 OMP 历史会话，显示运行、后台完成和等待输入状态。"
+window = "window.luau"
+styles = ["sidebar.css"]
