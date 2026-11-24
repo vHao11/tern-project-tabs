@@ -467,7 +467,8 @@ end
 local function button(text, role, action, props)
     props = props or {}
     props.key, props.role, props.actions = role, role, {click = action}
-    props.variant, props.size = "quiet", "sm"
+    if not props.variant then props.variant = "quiet" end
+    if not props.size then props.size = "sm" end
     return ui.button(text, props)
 end
 
@@ -480,10 +481,10 @@ local function addPager(nodes, list)
     local projectsPage = list == folders
     table.insert(nodes, ui.el("div", {key = "pager-" .. list.id, class = "pt-history-pager",
         attrs = {["data-pt-pages"] = list.id}}, {
-        button(if projectsPage then "上一页项目" else "上一页", "pt-history-prev", prev,
+        button(if projectsPage then "‹ 上页项目" else "‹ 上一页", "pt-history-prev", prev,
             {disabled = not navigation[prev] or restoring ~= nil}),
         ui.el("span", {class = "pt-history-page", text = tostring(list.page) .. " / " .. tostring(pages)}),
-        button(if projectsPage then "下一页项目" else "下一页", "pt-history-next", nextPage,
+        button(if projectsPage then "下页项目 ›" else "下一页 ›", "pt-history-next", nextPage,
             {disabled = not navigation[nextPage] or restoring ~= nil}),
     }))
 end
@@ -524,12 +525,20 @@ local function addSessions(nodes, list, menu)
         end
         table.insert(meta, ui.el("span", {class = "pt-history-date", text = item.date}))
         local checked = selection and selection[item.identity] == true
+        local headNodes = {}
+        if selection then
+            table.insert(headNodes, ui.el("span", {
+                class = if checked then "pt-history-check pt-history-checked" else "pt-history-check",
+                text = if checked then "✓" else "",
+            }))
+        end
+        table.insert(headNodes, ui.el("span", {class = "pt-history-name", text = item.label}))
         local control = ui.el("button", {key = item.key,
             class = if grouped then "pt-history-item pt-history-child" else "pt-history-item",
             title = item.label .. "\n" .. item.cwd .. "\n" .. item.date,
             attrs = {["data-pt-history"] = item.key, ["aria-pressed"] = if selection then tostring(checked) else nil},
             actions = {click = item.key}}, {
-            ui.el("span", {class = "pt-history-name", text = (if selection then (if checked then "☑  " else "☐  ") else "") .. item.label}),
+            ui.el("div", {class = "pt-history-head"}, headNodes),
             ui.el("div", {class = "pt-history-meta"}, meta),
         })
         table.insert(nodes, if selection then control else withMenu(item.key, item.label, control, menu))
@@ -560,19 +569,20 @@ local function addProjects(nodes, menu)
 end
 
 local function historyCard(menu)
-    local tools = {
-        button("按项目", "pt-history-by-project", "history-projects",
-            {on = mode == "projects", disabled = restoring ~= nil, title = "按 OMP 启动目录分组"}),
+    local seg = ui.el("div", {key = "seg", class = "pt-history-seg"}, {
         button("按时间", "pt-history-by-time", "history-time",
             {on = mode == "time", disabled = restoring ~= nil, title = "查看所有项目最近更新的对话"}),
-    }
+        button("按项目", "pt-history-by-project", "history-projects",
+            {on = mode == "projects", disabled = restoring ~= nil, title = "按 OMP 启动目录分组"}),
+    })
+    local tools = {seg}
     if not selection then table.insert(tools, menu("历史会话操作", historyActions("root"), "hmore-root")) end
     local card = {ui.el("div", {key = "views", class = "pt-history-views"}, tools)}
     if selection then
         local count = keyCount(selection)
         table.insert(card, ui.el("div", {key = "selection", class = "pt-history-selection"}, {
             button("清除所选（" .. count .. "）", "pt-history-clear-selected", "history-clear-selected",
-                {disabled = count == 0 or clearing ~= nil}),
+                {variant = if count > 0 then "danger" else "quiet", disabled = count == 0 or clearing ~= nil}),
             button("取消", "pt-history-end-select", "history-end-select"),
         }))
     end
@@ -589,9 +599,18 @@ end
 
 function M.view(menu)
     visible, navigation = {}, {}
-    local header = button(if expanded then "▾  OMP 历史会话" else "▸  OMP 历史会话",
-        "pt-history-toggle", "history-toggle", {title = "展开或收起本机所有项目的 OMP 历史会话",
-            attrs = {["aria-expanded"] = tostring(expanded)}})
+    local header = ui.el("button", {
+        key = "pt-history-toggle",
+        role = "pt-history-toggle",
+        class = if expanded then "pt-history-toggle pt-history-open" else "pt-history-toggle",
+        title = "展开或收起本机所有项目的 OMP 历史会话",
+        aria = "OMP 历史会话",
+        attrs = {["aria-expanded"] = tostring(expanded)},
+        actions = {click = "history-toggle"},
+    }, {
+        ui.el("span", {class = "pt-history-toggle-label", text = "OMP 历史会话"}),
+        ui.el("span", {class = "pt-history-toggle-caret", text = if expanded then "▾" else "▸"}),
+    })
     local nodes = {header}
     if expanded then drawnCard = historyCard(menu) end
     if drawnCard then
@@ -715,23 +734,15 @@ function M.archiveTab(cx, tab, update, close)
         end)
     end
     readTarget(function(files, original, first)
-        local detail = if #files == 0 then "此标签没有已报告的 OMP 会话，确认后关闭标签。"
-            else tostring(#files) .. " 个会话将从插件历史移除，保留 OMP 原始记录。"
-        confirm(first, "归档并关闭「" .. tab.label .. "」？", "确认归档并关闭", detail, function(accepted, current)
-            if not accepted or not current then stop(current); return end
-            readTarget(function(checked, shape, ready)
-                if shape ~= original then stop(ready, "标签内容已变更，请重新选择归档"); return end
-                if #checked == 0 then stop(ready); close(ready, tab); return end
-                readIdentities(checked, function(keys, verified)
-                    if not keys then stop(verified, "无法核对 OMP 会话文件，标签保留，请重试"); return end
-                    persist(verified, keys, update, function(ok, saved)
-                        if not ok then stop(saved, "归档保存失败，标签保留，请重试"); return end
-                        readTarget(function(_, finalShape, fresh)
-                            if finalShape ~= original then stop(fresh, "归档已保存，标签内容已变更，已保留标签"); return end
-                            stop(fresh)
-                            close(fresh, tab)
-                        end)
-                    end)
+        if #files == 0 then stop(first); close(first, tab); return end
+        readIdentities(files, function(keys, verified)
+            if not keys then stop(verified, "无法核对 OMP 会话文件，标签保留，请重试"); return end
+            persist(verified, keys, update, function(ok, saved)
+                if not ok then stop(saved, "归档保存失败，标签保留，请重试"); return end
+                readTarget(function(_, finalShape, fresh)
+                    if finalShape ~= original then stop(fresh, "归档已保存，标签内容已变更，已保留标签"); return end
+                    stop(fresh)
+                    close(fresh, tab)
                 end)
             end)
         end)

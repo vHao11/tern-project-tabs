@@ -43,7 +43,7 @@ local function groupMark(id, waiting, unread)
         table.insert(marks, mark("waiting", "waiting", "!", waiting .. " 个标签等待确认或输入", id))
     end
     if unread > 0 then
-        table.insert(marks, mark("unread", "unread", "● " .. unread, unread .. " 个标签已在后台完成", id))
+        table.insert(marks, mark("unread", "unread pt-mark-count", "● " .. unread, unread .. " 个标签已在后台完成", id))
     end
     return ui.el("div", { key = "activity", class = "pt-group-marks" }, marks)
 end

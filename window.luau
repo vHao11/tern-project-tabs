@@ -252,7 +252,7 @@ local function menuItems(key, isTab)
     if isTab then
         local items = {{ id = "rename-" .. key, label = "重命名标签", icon = "pen" }}
         if targets[key] and targets[key].canArchive then
-            table.insert(items, {id = "archive-" .. key, label = "归档并关闭…"})
+            table.insert(items, { id = "archive-" .. key, label = "归档并关闭", icon = "inbox" })
         end
         table.insert(items, { id = "close-" .. key, label = "关闭标签", icon = "x", danger = true })
         return items
@@ -326,13 +326,21 @@ local function render(groups, anchored)
     local nodes = {history.view(actionMenu)}
     indicators.reset()
     for _, g in groups do
-        local caret = if g.closed then "▸  " else "▾  "
         local location = g.path or g.name
-        local heading = ui.button(caret .. g.label .. "  (" .. #g.tabs .. ")", {
-            key = "fold", variant = "quiet", title = if g.alias then g.label .. "\n" .. location else location,
+        local count = tostring(#g.tabs)
+        local heading = ui.el("button", {
+            key = "fold", class = "pt-group-btn",
+            title = if g.alias then g.label .. "\n" .. location else location,
+            aria = g.label .. "，" .. count .. " 个标签",
+            attrs = { ["aria-expanded"] = tostring(not g.closed) },
             actions = { click = g.id },
+        }, {
+            ui.el("span", { class = "pt-group-caret", text = if g.closed then "▸" else "▾" }),
+            ui.el("span", { class = "pt-group-name", text = g.label }),
+            ui.el("span", { class = "pt-group-count", text = count }),
         })
-        table.insert(nodes, row("pt-group", g.id, heading, rowMenu(g.id, g.label, false, anchored),
+        table.insert(nodes, row(if g.closed then "pt-group pt-group-closed" else "pt-group",
+            g.id, heading, rowMenu(g.id, g.label, false, anchored),
             if g.closed then indicators.group(g) else nil))
         if not g.closed then
             for _, tab in g.tabs do
@@ -404,7 +412,8 @@ sync = function(cx)
         local id = cx.canvas:open({
             title = title, about = ownerNote, view = view, target = target, dir = "left",
             ratio = width, focus = false,
-            dock = ui.button("隐藏项目栏", { key = "hide", variant = "quiet", actions = { click = "hide" } }),
+            dock = ui.button("隐藏项目栏", { key = "hide", role = "pt-hide", variant = "quiet", size = "sm",
+                actions = { click = "hide" } }),
         })
         if not id then nativeTabs(false); return end
         panel, panelTab = id, active
