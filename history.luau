@@ -3,6 +3,7 @@ local archive = require("./archive")
 local ui = tern.ui
 local M = { revision = 0 }
 local pageSize = 6
+local probeBytes = 2048
 local windows = tern.runtime.os == "windows"
 local ternCli = if windows then "tern.com" else "tern"
 local expanded, loading, restoring = false, false, nil
@@ -11,7 +12,9 @@ local folders = {id = "projects", items = {}, page = 1}
 local byPath, visible, navigation = {}, {}, {}
 local generation, mode, namesDirty = 0, "projects", false
 local cache = {}
+local indexedCount, indexedRoots
 local worker, loadError, restoreError, windowsReader
+local drawnCard, closeTimer
 local selection, clearing
 local archivingTabs = {}
 -- Covers the interval between creating the tab and OMP reporting its session file.
@@ -22,15 +25,27 @@ local function changed(update)
     update()
 end
 
-function M.collapse()
+function M.collapse(afterClose)
     generation += 1
     if worker then worker:kill(); worker = nil end
+    if closeTimer then closeTimer:cancel(); closeTimer = nil end
+    if expanded and afterClose and drawnCard then
+        closeTimer = tern.timer(120, function()
+            closeTimer, drawnCard = nil, nil
+            changed(afterClose)
+        end)
+    else
+        drawnCard = nil
+    end
     expanded, loading, restoring, loadError, restoreError = false, false, nil, nil, nil
-    timeline.items, timeline.page = {}, 1
-    folders.items, folders.page = {}, 1
-    byPath, visible, navigation = {}, {}, {}
+    visible, navigation = {}, {}
     selection, clearing = nil, nil
     M.revision += 1
+end
+
+local function resetIndex()
+    timeline.items, folders.items, byPath = {}, {}, {}
+    indexedCount = nil
 end
 
 function M.namesChanged()
@@ -91,6 +106,71 @@ local function ioRequest(op, paths, done)
     run(args, opts, done)
 end
 
+local function probeEnv(env)
+    env.PT_HISTORY_PROBE_BYTES = tostring(probeBytes)
+    env.PT_HISTORY_FULL_FIRST = if windows then "0" else tostring(pageSize)
+    return env
+end
+
+local function windowsIndex(ticket)
+    local onLine, onEnd
+    local function endBatch(ok)
+        local done = onEnd
+        onLine, onEnd = nil, nil
+        if done then done(ok) end
+    end
+    return function(op, paths, receive, done)
+        onLine, onEnd = receive, done
+        local ok = pcall(function()
+            if not worker then
+                local args, env = readerCommand("index")
+                worker = tern.process.spawn(args, {
+                    env = probeEnv(env), split = "lines",
+                    stdout = function(line)
+                        if ticket ~= generation or not onLine then return end
+                        if line == "." then endBatch(true) else onLine(line) end
+                    end,
+                    exit = function()
+                        if ticket ~= generation then return end
+                        worker = nil
+                        endBatch(false)
+                    end,
+                })
+            end
+            worker:write(op .. " " .. tern.base64.encode(table.concat(paths, "\0")) .. "\n")
+        end)
+        if not ok then endBatch(false) end
+    end
+end
+
+local function posixRequest(op, paths, receive, done)
+    if op == "list" then
+        ioRequest(op, paths, function(output)
+            if output then receive(output) end
+            done(output ~= nil)
+        end)
+        return
+    end
+    local args = readerCommand(op)
+    local ok = pcall(function()
+        worker = tern.process.spawn(args, {
+            env = if op == "probe" then probeEnv({}) else nil, split = "lines", stdout = receive,
+            exit = function(result) done(result.status == 0) end,
+        })
+        worker:write(table.concat(paths, "\0") .. "\0")
+        worker:close_stdin()
+    end)
+    if not ok then
+        if worker then worker:kill() end
+        done(false)
+    end
+end
+
+local function closeIndex()
+    if windows and worker then worker:close_stdin() end
+    worker, loading = nil, false
+end
+
 local function shortText(value)
     if type(value) ~= "string" then return nil end
     local first = value:match("^%s*([^\r\n]+)")
@@ -114,11 +194,13 @@ local function promptText(content)
     return nil
 end
 
-local function parseEntry(file, encoded, allowEmpty)
+local function parseEntry(file, encoded, allowEmpty, probe)
     if not encoded or encoded == "" then return nil end
     local bytes = tern.base64.decode(encoded)
+    local shortProbe = probe and #bytes == probeBytes
+    local lines = if shortProbe then bytes:match("^(.*\n)") or "" else bytes
     local header, name, first, hasMessage
-    for line in bytes:gmatch("[^\n]+") do
+    for line in lines:gmatch("[^\n]+") do
         local ok, item = pcall(tern.json.decode, line)
         if ok and type(item) == "table" then
             if item.type == "title" then name = shortText(item.title) or name
@@ -130,6 +212,8 @@ local function parseEntry(file, encoded, allowEmpty)
         end
         if header and (name or first) then break end
     end
+    -- A short probe is definitive only at EOF or once the normal parser would stop.
+    if shortProbe and not (header and (name or first)) then return nil, true end
     if not header or type(header.id) ~= "string" or header.id == "" then return nil end
     local cwd = projects.path(header.cwd)
     if not projects.isAbsolute(cwd) then return nil end
@@ -140,7 +224,7 @@ local function parseEntry(file, encoded, allowEmpty)
         date = os.date("%Y-%m-%d %H:%M", math.floor(file.time)), key = "hist-" .. tern.sha256(file.path)}
 end
 
-local function addEntry(entry)
+local function addEntry(entry, previousGroups)
     if archive.has(entry.identity) then return end
     table.insert(timeline.items, entry)
     -- The storage bucket is encoded and can contain sessions moved from another cwd.
@@ -148,6 +232,8 @@ local function addEntry(entry)
     local group = byPath[key]
     if not group then
         group = {id = "folder-" .. tern.sha256(key), key = key, path = entry.cwd, items = {}, page = 1}
+        local previous = previousGroups and previousGroups[key]
+        if previous then group.page, group.open = previous.page, previous.open end
         byPath[key] = group
         table.insert(folders.items, group)
         namesDirty = true
@@ -182,6 +268,7 @@ function M.refreshArchive()
     local ok, modified = pcall(archive.refresh, false)
     if not ok then
         M.collapse()
+        resetIndex()
         expanded, loadError = true, "无法读取归档记录，请重试"
     elseif modified then
         filterArchived()
@@ -198,7 +285,8 @@ local function persist(cx, keys, update, done)
     run(args, {env = env, stdin = data, timeout_ms = 30000}, function(output, current)
         if output == nil then done(false, current); return end
         archive.committed(batch, data)
-        if expanded then filterArchived(); update() end
+        filterArchived()
+        if expanded then update() end
         done(true, current)
     end)
 end
@@ -211,10 +299,10 @@ local function confirm(cx, subject, label, detail, done)
     end)
 end
 
-local function indexFiles(files, ticket, update)
+local function indexFiles(files, ticket, update, request)
     local previous = cache
     cache = {}
-    local missing, paths = {}, {}
+    local missing = {}
     for _, file in files do
         local saved = previous[file.path]
         if saved and saved.stamp == file.stamp then
@@ -222,87 +310,112 @@ local function indexFiles(files, ticket, update)
             cache[file.path] = saved
         else
             table.insert(missing, file)
-            table.insert(paths, file.path)
         end
+    end
+    if #missing == 0 and indexedCount == #files then
+        closeIndex()
+        changed(update)
+        return
     end
 
     -- Consume in mtime order, including when a new file precedes already cached ones.
     -- A project's first valid entry is its latest, so both lists stay ordered.
-    local cursor = 1
-    local function publishReady()
-        while files[cursor] and files[cursor].ready do
-            local entry = files[cursor].entry
-            if entry then addEntry(entry) end
-            cursor += 1
-        end
-        changed(update)
-    end
-    if #missing == 0 then loading = false end
-    publishReady()
-    if not loading then return end
-
-    local args, env = readerCommand("read")
-    local received = 0
+    local previousGroups = byPath
+    resetIndex()
+    local cursor, nextPaint = 1, 0
+    local readDone, publishTimer = #missing == 0, nil
     local function finish(ok)
         if ticket ~= generation or not loading then return end
-        worker, loading = nil, false
-        if not ok then loadError = "读取历史记录失败，请重试" end
+        closeIndex()
+        if ok and cursor > #files then
+            indexedCount = #files
+        else
+            loadError = "读取历史记录失败，请重试"
+        end
+        clampPage(timeline)
+        clampPage(folders)
+        for _, group in folders.items do clampPage(group) end
         changed(update)
     end
-    if not args then finish(false); return end
+    local function publishReady()
+        if publishTimer then return end
+        local start = cursor
+        -- One late prefix can unblock thousands of cached entries on the UI thread.
+        while files[cursor] and files[cursor].ready and cursor - start < 128 do
+            local entry = files[cursor].entry
+            if entry then addEntry(entry, previousGroups) end
+            cursor += 1
+        end
+        if cursor ~= start and tern.now() >= nextPaint then
+            changed(update)
+            nextPaint = tern.now() + 120
+        end
+        if files[cursor] and files[cursor].ready then
+            publishTimer = tern.timer(0, function()
+                publishTimer = nil
+                if ticket == generation and loading then publishReady() end
+            end)
+        elseif readDone then
+            finish(cursor > #files)
+        end
+    end
+    publishReady()
+    if readDone then return end
 
-    -- Stream uncached prefixes through one worker; only display metadata survives a refresh.
-    local ok = pcall(function()
-        worker = tern.process.spawn(args, {
-            env = env, split = "lines",
-            stdout = function(line)
-                if ticket ~= generation or not loading then return end
-                received += 1
-                local file = missing[received]
-                if not file or line:sub(1, 1) ~= ":" then return end
-                file.ready = true
-                if #line > 1 then
-                    local parsed, entry = pcall(parseEntry, file, line:sub(2))
-                    if parsed then
-                        file.entry = entry
-                        cache[file.path] = {stamp = file.stamp, entry = entry}
-                    end
-                end
-                publishReady()
-            end,
-            exit = function(result)
-                finish(result.status == 0 and received == #missing and cursor > #files)
-            end,
-        })
-        worker:write(table.concat(paths, "\0") .. (if windows then "" else "\0"))
-        worker:close_stdin()
-    end)
-    if not ok then
-        if worker then worker:kill() end
-        finish(false)
+    -- Read the newest page in full. Older files usually need only the header and
+    -- first prompt. Batch any ambiguous probes into one full-prefix retry.
+    local function scan(batch, probe, done)
+        local paths, retry, received = {}, {}, 0
+        for _, file in batch do table.insert(paths, file.path) end
+        request(if probe then "probe" else "read", paths, function(line)
+            if ticket ~= generation or not loading then return end
+            received += 1
+            local file = batch[received]
+            if not file or line:sub(1, 1) ~= ":" then return end
+            local parsed, entry, incomplete = pcall(parseEntry, file, line:sub(2), false, probe)
+            if parsed and incomplete then
+                table.insert(retry, file)
+                return
+            end
+            file.ready, file.entry = true, if parsed then entry else nil
+            if parsed and #line > 1 then cache[file.path] = {stamp = file.stamp, entry = entry} end
+            publishReady()
+        end, function(ok)
+            if ticket ~= generation or not loading then return end
+            if not ok or received ~= #batch then finish(false)
+            elseif #retry > 0 then scan(retry, false, done)
+            else done() end
+        end)
+    end
+    local function allRead()
+        readDone = true
+        publishReady()
+    end
+    if windows and #missing > pageSize then
+        local first = table.move(missing, 1, pageSize, 1, {})
+        local rest = table.move(missing, pageSize + 1, #missing, 1, {})
+        scan(first, false, function()
+            changed(update)
+            -- Let the first page paint before the same worker streams the remainder.
+            tern.timer(16, function()
+                if ticket == generation then scan(rest, true, allRead) end
+            end)
+        end)
+    else
+        scan(missing, #missing > pageSize, allRead)
     end
 end
 
-local function list(update)
-    M.collapse()
-    expanded, loading = true, true
-    mode = if tern.kv.get("history-view") == "time" then "time" else "projects"
-    local ticket, roots = generation, sessionsRoots()
-    changed(update)
-    if not pcall(archive.refresh, true) then
-        loading, loadError = false, "无法读取归档记录，请重试"
-        changed(update)
-        return
-    end
-    if not roots then
-        loading, loadError = false, "无法确定 OMP 历史目录"
-        changed(update)
-        return
-    end
-    ioRequest("list", roots, function(output)
+local function readDirectory(roots, ticket, update)
+    local request = if windows then windowsIndex(ticket) else posixRequest
+    local parts = {}
+    request("list", roots, function(part) table.insert(parts, part) end, function(complete)
         if ticket ~= generation then return end
-        if not output or (#output > 0 and output:sub(-1) ~= "\0") then
-            loading, loadError = false, "无法完整读取 OMP 历史目录，请重试"
+        local output = table.concat(parts)
+        if not complete or (#output > 0 and output:sub(-1) ~= "\0") then
+            closeIndex()
+            resetIndex()
+            loadError = "无法完整读取 OMP 历史目录，请重试"
             changed(update)
             return
         end
@@ -315,7 +428,39 @@ local function list(update)
             if a.time == b.time then return a.path > b.path end
             return a.time > b.time
         end)
-        indexFiles(files, ticket, update)
+        indexFiles(files, ticket, update, request)
+    end)
+end
+
+local function list(update)
+    M.collapse()
+    expanded, loading = true, true
+    mode = if tern.kv.get("history-view") == "time" then "time" else "projects"
+    local ticket, roots = generation, sessionsRoots()
+    local rootsKey = roots and table.concat(roots, "\0")
+    if indexedRoots ~= rootsKey then
+        resetIndex()
+        cache, indexedRoots = {}, rootsKey
+    end
+    timeline.page, folders.page = 1, 1
+    for _, group in folders.items do group.page, group.open = 1, false end
+    namesDirty = true
+    local ok, modified = pcall(archive.refresh, true)
+    if not ok then
+        resetIndex()
+        loading, loadError = false, "无法读取归档记录，请重试"
+        changed(update)
+        return
+    end
+    if modified then filterArchived() end
+    if not roots then
+        loading, loadError = false, "无法确定 OMP 历史目录"
+        changed(update)
+        return
+    end
+    changed(update)
+    tern.timer(16, function()
+        if ticket == generation then readDirectory(roots, ticket, update) end
     end)
 end
 
@@ -414,32 +559,48 @@ local function addProjects(nodes, menu)
     addPager(nodes, folders)
 end
 
-function M.view(menu)
-    local header = button(if expanded then "▾  OMP 历史会话" else "▸  OMP 历史会话",
-        "pt-history-toggle", "history-toggle", {title = "展开或收起本机所有项目的 OMP 历史会话"})
-    visible, navigation = {}, {}
-    local nodes = {if expanded and not selection then withMenu("root", "OMP 历史会话", header, menu) else header}
-    if expanded then
-        table.insert(nodes, ui.el("div", {key = "views", class = "pt-history-views"}, {
-            button("按项目", "pt-history-by-project", "history-projects",
-                {on = mode == "projects", disabled = restoring ~= nil, title = "按 OMP 启动目录分组"}),
-            button("按时间", "pt-history-by-time", "history-time",
-                {on = mode == "time", disabled = restoring ~= nil, title = "查看所有项目最近更新的对话"}),
+local function historyCard(menu)
+    local tools = {
+        button("按项目", "pt-history-by-project", "history-projects",
+            {on = mode == "projects", disabled = restoring ~= nil, title = "按 OMP 启动目录分组"}),
+        button("按时间", "pt-history-by-time", "history-time",
+            {on = mode == "time", disabled = restoring ~= nil, title = "查看所有项目最近更新的对话"}),
+    }
+    if not selection then table.insert(tools, menu("历史会话操作", historyActions("root"), "hmore-root")) end
+    local card = {ui.el("div", {key = "views", class = "pt-history-views"}, tools)}
+    if selection then
+        local count = keyCount(selection)
+        table.insert(card, ui.el("div", {key = "selection", class = "pt-history-selection"}, {
+            button("清除所选（" .. count .. "）", "pt-history-clear-selected", "history-clear-selected",
+                {disabled = count == 0 or clearing ~= nil}),
+            button("取消", "pt-history-end-select", "history-end-select"),
         }))
-        if selection then
-            local count = keyCount(selection)
-            table.insert(nodes, ui.el("div", {key = "selection", class = "pt-history-selection"}, {
-                button("清除所选（" .. count .. "）", "pt-history-clear-selected", "history-clear-selected",
-                    {disabled = count == 0 or clearing ~= nil}),
-                button("取消", "pt-history-end-select", "history-end-select"),
-            }))
-        end
-        if mode == "time" then addSessions(nodes, timeline, menu) else addProjects(nodes, menu) end
-        local note = loadError or restoreError or (if restoring then "正在打开会话…"
-            elseif loading then "正在读取历史…"
-            elseif #timeline.items == 0 then "暂无历史会话" else nil)
-        if note then table.insert(nodes, ui.el("div", {class = "pt-history-note", text = note})) end
-        if loadError then table.insert(nodes, button("重试", "pt-history-retry", "history-retry")) end
+    end
+    local rows = {}
+    if mode == "time" then addSessions(rows, timeline, menu) else addProjects(rows, menu) end
+    local note = loadError or restoreError or (if restoring then "正在打开会话…"
+        elseif loading then "正在读取历史…" elseif #timeline.items == 0 then "暂无历史会话" else nil)
+    if note then table.insert(rows, ui.el("div", {key = "note", class = "pt-history-note", text = note})) end
+    if loadError then table.insert(rows, button("重试", "pt-history-retry", "history-retry")) end
+    table.insert(card, ui.el("div", {key = "rows", class = "pt-history-scroll"}, rows))
+    return ui.el("div", {key = "card", class = "pt-history-card", aria = "OMP 历史会话",
+        attrs = {role = "dialog"}}, card)
+end
+
+function M.view(menu)
+    visible, navigation = {}, {}
+    local header = button(if expanded then "▾  OMP 历史会话" else "▸  OMP 历史会话",
+        "pt-history-toggle", "history-toggle", {title = "展开或收起本机所有项目的 OMP 历史会话",
+            attrs = {["aria-expanded"] = tostring(expanded)}})
+    local nodes = {header}
+    if expanded then drawnCard = historyCard(menu) end
+    if drawnCard then
+        table.insert(nodes, ui.el("div", {key = "layer",
+            class = if expanded then "pt-history-layer" else "pt-history-layer pt-history-leaving"}, {
+            ui.el("div", {key = "outside", class = "pt-history-dismiss", attrs = {["aria-hidden"] = "true"},
+                actions = {click = "history-close"}}),
+            drawnCard,
+        }))
     end
     return ui.el("div", {key = "history", class = "pt-history"}, nodes)
 end
@@ -634,7 +795,9 @@ end
 
 function M.handle(cx, act, update, destination, reveal)
     if act == "history-toggle" then
-        if expanded then M.collapse(); update() else list(update) end
+        if expanded then M.collapse(update); update() else list(update) end
+    elseif act == "history-close" then
+        if expanded then M.collapse(update); update() end
     elseif not expanded then return false
     elseif act == "history-retry" then list(update)
     elseif act:sub(1, 6) == "hmore-" then

@@ -15,7 +15,8 @@ local roots = {}
 local groupIds, nextGroupId = {}, 0
 local targets, headings, groupByTab = {}, {}, {}
 local lastView, lastContent, width = nil, nil, 0.21
-local pending, heartbeat, markerTimer
+local lastHistoryRevision
+local pending, heartbeat, markerTimer, historyTimer
 local sync, rememberWidth
 
 local function selectedTab(cx)
@@ -116,6 +117,7 @@ local function dropPanel(cx)
     panel, panelTab, lastView = nil, nil, nil
     targets, headings, groupByTab = {}, {}, {}
     if markerTimer then markerTimer:cancel(); markerTimer = nil end
+    if historyTimer then historyTimer:cancel(); historyTimer = nil end
     indicators.reset()
     nativeTabs(false)
     if id and cx.session:pane(id) then cx.layout:close(id) end
@@ -278,6 +280,25 @@ local function rowMenu(key, label, isTab, anchored)
     return actionMenu(title, menuItems(key, isTab), "more-" .. key, anchored)
 end
 
+local function paintHistory(cx)
+    if lastHistoryRevision == history.revision then return end
+    -- The native picker keeps row actions reachable at the edge of the scrolling card.
+    cx.canvas:set(panel, {set = {history = history.view(actionMenu)}})
+    lastHistoryRevision = history.revision
+end
+
+local function requestHistoryUpdate()
+    if not shown or historyTimer then return end
+    historyTimer = tern.timer(0, function(cx)
+        historyTimer = nil
+        if panel and lastView and cx.session:tab_of(panel) == selectedTab(cx) then
+            paintHistory(cx)
+        else
+            requestUpdate()
+        end
+    end)
+end
+
 local function describe(groups, active)
     local clicks, folds, membership, signature = {}, {}, {}, {}
     projects.labelGroups(groups)
@@ -302,9 +323,7 @@ local function describe(groups, active)
 end
 
 local function render(groups, anchored)
-    local nodes = {history.view(function(label, items, fallback)
-        return actionMenu(label, items, fallback, anchored)
-    end)}
+    local nodes = {history.view(actionMenu)}
     indicators.reset()
     for _, g in groups do
         local caret = if g.closed then "▸  " else "▾  "
@@ -374,9 +393,10 @@ sync = function(cx)
     local mounted = panel and panelTab == active and cx.session:tab_of(panel) == active
     local target = if mounted then panel else preferredTarget(layout, content, panes)
     local anchored = spansHeight(layout and layout.root, target)
-    local signature = (if anchored then "menu" else "picker") .. tostring(history.revision) .. describe(groups, active)
+    local signature = (if anchored then "menu" else "picker") .. describe(groups, active)
     if mounted then
-        if lastView ~= signature then cx.canvas:set(panel, { view = render(groups, anchored) }) end
+        if lastView ~= signature then cx.canvas:set(panel, { view = render(groups, anchored) })
+        else paintHistory(cx) end
     else
         local view = render(groups, anchored)
         local old = panel
@@ -400,7 +420,7 @@ sync = function(cx)
             end
         end
     end
-    lastView = signature
+    lastView, lastHistoryRevision = signature, history.revision
     nativeTabs(true)
     indicators.flush(cx, panel, groupByTab)
 end
@@ -574,7 +594,7 @@ local function runRowAction(cx, act)
     elseif verb == "rename" then
         renameFromRow(cx, key)
     elseif verb == "archive" then
-        history.archiveTab(cx, targets[key], requestUpdate, closeTab)
+        history.archiveTab(cx, targets[key], requestHistoryUpdate, closeTab)
     elseif verb == "close" then
         closeTab(cx, targets[key])
     else
@@ -647,7 +667,10 @@ end)
 
 tern.on("canvas_action", function(ev, cx)
     if ev.pane ~= panel then return false end
-    if history.handle(cx, ev.act, requestUpdate, historySession, revealHistory) then return true end
+    if history.handle(cx, ev.act, requestHistoryUpdate, historySession, revealHistory) then
+        paintHistory(cx)
+        return true
+    end
     if runRowAction(cx, ev.act) then return true end
     local more = ev.act:match("^more%-(.+)$")
     if ev.act == "hide" then
