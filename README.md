@@ -1,16 +1,24 @@
-# Tern 项目标签栏
+# Project Tabs for Tern
 
-在左侧按项目列出当前窗口可见的已打开标签。点击项目名可以折叠或展开，点击标签会回到原来的文件或终端。项目栏跟随当前标签，文件树可以单独开关。
+在 Tern 左侧按项目管理标签，查看 OMP 对话的运行状态，在原项目目录恢复历史会话。点击项目名可以折叠或展开，点击标签会回到原来的文件或终端。项目栏跟随当前标签，文件树可以单独开关。
 
-## 安装
+## 安装与升级
 
-在装有 Tern 的电脑上解压 `project-tabs.zip`，在包含 `plugin.toml` 的目录打开终端，执行下面的命令。此版本已在 Windows 版 Tern 0.9.32 验证。
+在已安装 Tern 的终端运行下面的命令。项目标签栏使用 Tern 插件系统，历史会话功能还需要本机安装 OMP。1.7.0 已在 Windows 版 Tern 0.9.32 验证。
 
 ```sh
-tern plugin install .
+tern plugin install https://github.com/vHao11/tern-project-tabs
 ```
 
-已有旧版时，在新版解压目录运行 `tern plugin install . --force` 即可升级。
+已有旧版时运行升级命令。
+
+```sh
+tern plugin install https://github.com/vHao11/tern-project-tabs --force
+```
+
+离线安装可从发布页下载 `project-tabs.zip`，解压后在含有 `plugin.toml` 的目录运行 `tern plugin install .`。升级本地安装时使用 `tern plugin install . --force`。[下载发布包](https://github.com/vHao11/tern-project-tabs/releases)
+
+安装后按 **Alt+F9** 切换项目标签栏，也可以从 Files 标题栏的文件夹按钮打开。
 
 ## 使用
 
@@ -42,3 +50,5 @@ tern plugin install .
 项目栏使用 Tern 的原生分屏。如果标签已经上下分屏，重新进入时项目栏会放在左上窗格旁边。颜色跟随当前主题。
 
 桌面上的标题会用满这一行。鼠标移到项目或标签上时，右端会浮出黑色渐变和白色「⋯」。状态点和折叠项目的未读数仍可见。点「⋯」打开菜单，点空白处可收起。项目栏只占窗口的一部分高度时，「⋯」会使用 Tern 的操作选择器，可点击选项或用方向键和 Enter 选择。
+
+[维护与发布说明](https://github.com/vHao11/tern-project-tabs/blob/main/MAINTAINING.md) · [MIT 许可证](LICENSE)
