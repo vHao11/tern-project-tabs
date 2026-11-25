@@ -10,7 +10,9 @@ local desktop = tern.runtime.os == "windows" or tern.runtime.os == "macos" or te
 
 local initialized, shown, compactTop = false, true, false
 local stateKey, ownerNote, panel, panelTab
-local folded, remembered, repos = {}, {}, {}
+local folded, pinned, remembered, repos = {}, {}, {}, {}
+local pinSeq = 0
+local pinnedFoldKey = "__pinned__"
 local roots = {}
 local groupIds, nextGroupId = {}, 0
 local targets, headings, groupByTab = {}, {}, {}
@@ -67,6 +69,10 @@ local function nativeTabs(compact)
     end
 end
 
+local function savePinned()
+    tern.kv.set(stateKey .. ":pinned", if next(pinned) then pinned else nil)
+end
+
 local function initialize(cx)
     if initialized then return end
     local key = cx:window_key()
@@ -75,6 +81,15 @@ local function initialize(cx)
     shown = tern.kv.get(stateKey .. ":visible") ~= false
     local saved = tern.kv.get(stateKey .. ":folded")
     if type(saved) == "table" then folded = saved end
+    local savedPinned = tern.kv.get(stateKey .. ":pinned")
+    if type(savedPinned) == "table" then
+        for id, order in savedPinned do
+            if type(id) == "string" and type(order) == "number" then
+                pinned[id] = order
+                if order > pinSeq then pinSeq = order end
+            end
+        end
+    end
     local savedWidth = tern.kv.get(stateKey .. ":width")
     if type(savedWidth) == "number" and savedWidth > 0 and savedWidth < 1 then width = savedWidth end
     roots = tern.kv.get("project-folders") or {}
@@ -230,6 +245,17 @@ local function collect(cx, active)
         end
     end
     remembered = liveTabs
+    if next(liveTabs) ~= nil then
+        local pruned = false
+        for idKey in pinned do
+            local numeric = tonumber(idKey)
+            if not numeric or not liveTabs[numeric] then
+                pinned[idKey] = nil
+                pruned = true
+            end
+        end
+        if pruned then savePinned() end
+    end
     activity.prune(liveTabs)
     table.sort(groups, function(a, b)
         local left, right = string.lower(a.name), string.lower(b.name)
@@ -239,9 +265,11 @@ local function collect(cx, active)
     return groups, content, panes, awaitingPanel
 end
 
-local function row(className, key, button, menu, marker)
+local function row(className, key, button, trailing, marker)
+    local titleChildren = { button }
+    if trailing then table.insert(titleChildren, trailing) end
     local children = {
-        ui.el("div", { key = "title", class = "pt-title-area" }, { button, menu }),
+        ui.el("div", { key = "title", class = "pt-title-area" }, titleChildren),
     }
     -- Activity patches target <row>.activity. Keep the marker outside the hover overlay.
     if marker then table.insert(children, marker) end
@@ -250,11 +278,13 @@ end
 
 local function menuItems(key, isTab)
     if isTab then
-        local items = {{ id = "rename-" .. key, label = "重命名标签", icon = "pen" }}
+        local items = {
+            { id = "rename-" .. key, label = "重命名标签", icon = "pen" },
+            { id = "close-" .. key, label = "关闭标签", icon = "x" },
+        }
         if targets[key] and targets[key].canArchive then
-            table.insert(items, { id = "archive-" .. key, label = "归档并关闭", icon = "inbox" })
+            table.insert(items, { id = "archive-" .. key, label = "关闭并移出历史", icon = "trash", danger = true })
         end
-        table.insert(items, { id = "close-" .. key, label = "关闭标签", icon = "x", danger = true })
         return items
     end
     local items = {}
@@ -302,10 +332,55 @@ end
 local function describe(groups, active)
     local clicks, folds, membership, signature = {}, {}, {}, {}
     projects.labelGroups(groups)
+    local pinnedTabs, visibleGroups = {}, {}
     for _, g in groups do
+        local rest = {}
+        for _, tab in g.tabs do
+            tab.projectLabel = g.label
+            tab.projectKey = g.key
+            local order = pinned[tostring(tab.id)]
+            if order then
+                tab.pinned = true
+                tab.pinOrder = order
+                table.insert(pinnedTabs, tab)
+            else
+                tab.pinned = false
+                table.insert(rest, tab)
+            end
+        end
+        if #rest > 0 then
+            g.tabs = rest
+            table.insert(visibleGroups, g)
+        end
+    end
+    table.sort(pinnedTabs, function(a, b)
+        if a.pinOrder == b.pinOrder then return a.id < b.id end
+        return a.pinOrder > b.pinOrder
+    end)
+    local pinnedGroup
+    if #pinnedTabs > 0 then
+        pinnedGroup = {
+            id = "pinned", key = pinnedFoldKey, name = "置顶", label = "置顶",
+            tabs = pinnedTabs, closed = folded[pinnedFoldKey] == true, pinned = true,
+        }
+        folds[pinnedGroup.id] = pinnedGroup
+        table.insert(signature, { pinnedGroup.key, #pinnedTabs, pinnedGroup.closed })
+        for _, tab in pinnedTabs do
+            membership[tab.id] = pinnedGroup
+            if pinnedGroup.closed then
+                table.insert(signature, tab.id)
+            else
+                tab.button = "t" .. tostring(tab.id)
+                tab.current = active == tab.id
+                clicks[tab.button] = tab
+                table.insert(signature, { tab.button, tab.label, tab.projectLabel, tab.path, tab.kind or "", tab.current, tab.canArchive, true })
+            end
+        end
+    end
+    for _, g in visibleGroups do
         g.closed = folded[g.key] == true
         folds[g.id] = g
-        table.insert(signature, {g.key, g.label, #g.tabs, g.closed})
+        table.insert(signature, { g.key, g.label, #g.tabs, g.closed })
         for _, tab in g.tabs do
             membership[tab.id] = g
             if g.closed then
@@ -314,17 +389,69 @@ local function describe(groups, active)
                 tab.button = "t" .. tostring(tab.id)
                 tab.current = active == tab.id
                 clicks[tab.button] = tab
-                table.insert(signature, {tab.button, tab.label, tab.path, tab.kind or "", tab.current, tab.canArchive})
+                table.insert(signature, { tab.button, tab.label, tab.path, tab.kind or "", tab.current, tab.canArchive, false })
             end
         end
     end
     targets, headings, groupByTab = clicks, folds, membership
-    return tern.json.encode(signature)
+    return tern.json.encode(signature), pinnedGroup, visibleGroups
 end
 
-local function render(groups, anchored)
+local function tabRow(tab, anchored, isPinned)
+    local tip = if isPinned then
+        tab.label .. "\n" .. tab.projectLabel .. (if tab.path == "" then "" else "\n" .. tab.path)
+    elseif tab.path == "" then tab.label
+    else tab.label .. "\n" .. tab.path
+    local button = ui.button(tab.label, {
+        key = "switch", variant = "quiet", on = tab.current, size = "sm",
+        icon = if tab.kind == "terminal" or tab.kind == "agent" then "terminal" else "file",
+        title = tip,
+        actions = { click = tab.button },
+    })
+    local pinBtn = ui.button("", {
+        key = "pin", role = "pt-pin", icon = "pin", size = "sm", variant = "quiet",
+        on = isPinned,
+        title = if isPinned then "取消置顶" else "置顶标签",
+        aria = (if isPinned then "取消置顶" else "置顶标签") .. "「" .. tab.label .. "」",
+        actions = { click = "pin-" .. tab.button },
+    })
+    local actions = ui.el("div", { key = "actions", class = "pt-row-actions" }, {
+        pinBtn,
+        rowMenu(tab.button, tab.label, true, anchored),
+    })
+    local className = "pt-tab"
+    if isPinned then className ..= " pt-pinned" end
+    if tab.current then className ..= " pt-current" end
+    return row(className, tab.button, button, actions, indicators.tab(tab.id))
+end
+
+local function render(pinnedGroup, groups, anchored)
     local nodes = {history.view(actionMenu)}
     indicators.reset()
+    if pinnedGroup then
+        local count = tostring(#pinnedGroup.tabs)
+        local heading = ui.el("button", {
+            key = "fold", class = "pt-group-btn pt-pinned-btn",
+            title = "展开或收起已置顶的标签",
+            aria = "置顶，" .. count .. " 个标签",
+            attrs = { ["aria-expanded"] = tostring(not pinnedGroup.closed) },
+            actions = { click = pinnedGroup.id },
+        }, {
+            ui.el("span", { class = "pt-group-caret", text = if pinnedGroup.closed then "▸" else "▾" }),
+            ui.el("span", { class = "pt-group-name", text = "置顶" }),
+            ui.el("span", { class = "pt-group-count", text = count }),
+        })
+        table.insert(nodes, row(if pinnedGroup.closed then "pt-group pt-pinned-group pt-group-closed" else "pt-group pt-pinned-group",
+            pinnedGroup.id, heading, nil, if pinnedGroup.closed then indicators.group(pinnedGroup) else nil))
+        if not pinnedGroup.closed then
+            for _, tab in pinnedGroup.tabs do
+                table.insert(nodes, tabRow(tab, anchored, true))
+            end
+        end
+        if #groups > 0 then
+            table.insert(nodes, ui.el("div", { key = "pinned-sep", class = "pt-pinned-sep" }))
+        end
+    end
     for _, g in groups do
         local location = g.path or g.name
         local count = tostring(#g.tabs)
@@ -344,14 +471,7 @@ local function render(groups, anchored)
             if g.closed then indicators.group(g) else nil))
         if not g.closed then
             for _, tab in g.tabs do
-                local button = ui.button(tab.label, {
-                    key = "switch", variant = "quiet", on = tab.current, size = "sm",
-                    icon = if tab.kind == "terminal" or tab.kind == "agent" then "terminal" else "file",
-                    title = if tab.path == "" then tab.label else tab.label .. "\n" .. tab.path,
-                    actions = { click = tab.button },
-                })
-                table.insert(nodes, row(if tab.current then "pt-tab pt-current" else "pt-tab", tab.button,
-                    button, rowMenu(tab.button, tab.label, true, anchored), indicators.tab(tab.id)))
+                table.insert(nodes, tabRow(tab, anchored, false))
             end
         end
     end
@@ -401,12 +521,13 @@ sync = function(cx)
     local mounted = panel and panelTab == active and cx.session:tab_of(panel) == active
     local target = if mounted then panel else preferredTarget(layout, content, panes)
     local anchored = spansHeight(layout and layout.root, target)
-    local signature = (if anchored then "menu" else "picker") .. describe(groups, active)
+    local desc, pinnedGroup, visibleGroups = describe(groups, active)
+    local signature = (if anchored then "menu" else "picker") .. desc
     if mounted then
-        if lastView ~= signature then cx.canvas:set(panel, { view = render(groups, anchored) })
+        if lastView ~= signature then cx.canvas:set(panel, { view = render(pinnedGroup, visibleGroups, anchored) })
         else paintHistory(cx) end
     else
-        local view = render(groups, anchored)
+        local view = render(pinnedGroup, visibleGroups, anchored)
         local old = panel
         if old and panelTab then rememberWidth(cx.session:layout(panelTab)) end
         local id = cx.canvas:open({
@@ -478,8 +599,8 @@ local function historySession(cx, cwd)
     local key = "|" .. projects.key(projectPath(cx, cwd, false, {left = 1}))
     local sameProject
     for _, group in headings do
-        if group.key == key then
-            for _, tab in group.tabs do
+        for _, tab in group.tabs do
+            if group.key == key or tab.projectKey == key then
                 if tab.session == current then return current end
                 sameProject = sameProject or tab.session
             end
@@ -596,9 +717,34 @@ local function renameFromRow(cx, key)
     end)
 end
 
+local function togglePin(cx, key)
+    local tab = targets[key]
+    if not tab then return end
+    local idKey = tostring(tab.id)
+    if pinned[idKey] then
+        pinned[idKey] = nil
+        if tab.projectKey and folded[tab.projectKey] then
+            folded[tab.projectKey] = nil
+            tern.kv.set(stateKey .. ":folded", folded)
+        end
+    else
+        pinSeq += 1
+        pinned[idKey] = pinSeq
+        if folded[pinnedFoldKey] then
+            folded[pinnedFoldKey] = nil
+            tern.kv.set(stateKey .. ":folded", folded)
+        end
+    end
+    savePinned()
+    if lastContent and cx.session:pane(lastContent) then cx.layout:focus(lastContent) end
+    sync(cx)
+end
+
 local function runRowAction(cx, act)
     local verb, key = act:match("^(%a+)%-(.+)$")
-    if verb == "new" then
+    if verb == "pin" then
+        togglePin(cx, key)
+    elseif verb == "new" then
         newConversation(cx, key)
     elseif verb == "rename" then
         renameFromRow(cx, key)
@@ -740,6 +886,11 @@ for _, event in { "cwd", "title", "tab_created", "pane_created", "session_ended"
 end
 tern.on("tab_closed", function(ev)
     activity.removeTab(ev.tab)
+    local idKey = tostring(ev.tab)
+    if pinned[idKey] then
+        pinned[idKey] = nil
+        savePinned()
+    end
     requestUpdate()
 end)
 tern.on("pane_closed", function(ev, cx)

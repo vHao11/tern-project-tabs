@@ -738,9 +738,9 @@ function M.archiveTab(cx, tab, update, close)
         readIdentities(files, function(keys, verified)
             if not keys then stop(verified, "无法核对 OMP 会话文件，标签保留，请重试"); return end
             persist(verified, keys, update, function(ok, saved)
-                if not ok then stop(saved, "归档保存失败，标签保留，请重试"); return end
+                if not ok then stop(saved, "无法移出历史记录，标签保留，请重试"); return end
                 readTarget(function(_, finalShape, fresh)
-                    if finalShape ~= original then stop(fresh, "归档已保存，标签内容已变更，已保留标签"); return end
+                    if finalShape ~= original then stop(fresh, "已移出插件历史，标签内容已变更，已保留标签"); return end
                     stop(fresh)
                     close(fresh, tab)
                 end)
