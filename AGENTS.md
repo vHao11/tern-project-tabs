@@ -27,6 +27,8 @@
 - **核心模块职责**：
   - `window.luau`：侧栏挂载、窗口状态恢复、标签与项目操作
   - `projects.luau`：路径规范化、项目分组与重名区分
+  - `ordering.luau`：标签排序模式（最近交互 / 固定顺序）、新开标签置前、平行自动放置顶与排序设置浮层
+  - `tabstate.luau`：置顶与标签顺序的跨重启指纹匹配持久化与 OMP 会话标识关联
   - `activity.luau` / `indicators.luau`：运行中、后台完成与等待输入状态指示
   - `history.luau` / `archive.luau` / `history-io.ps1` / `history-io.sh`：OMP 历史浮层、缓存索引与跨窗口归档
   - `sidebar.css`：侧栏布局、悬停操作栏、历史卡片与指示徽章样式

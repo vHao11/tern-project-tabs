@@ -2,23 +2,26 @@ local projects = require("./projects")
 local activity = require("./activity")
 local indicators = require("./indicators")
 local history = require("./history")
+local tabstate = require("./tabstate")
+local ordering = require("./ordering")
 local ui = tern.ui
 local action = "plugin.project-tabs.toggle"
 local title = "项目标签"
 local hideTopTabs = "#tabbar .tb-tabs { display: none !important; }"
 local desktop = tern.runtime.os == "windows" or tern.runtime.os == "macos" or tern.runtime.os == "linux"
 
-local initialized, shown, compactTop = false, true, false
+local initialized, shown, compactTop, unloading = false, true, false, false
 local stateKey, ownerNote, panel, panelTab
-local folded, pinned, remembered, repos = {}, {}, {}, {}
-local pinSeq = 0
+local folded, remembered, repos = {}, {}, {}
 local pinnedFoldKey = "__pinned__"
 local roots = {}
 local groupIds, nextGroupId = {}, 0
 local targets, headings, groupByTab = {}, {}, {}
 local lastView, lastContent, width = nil, nil, 0.21
 local lastHistoryRevision
-local pending, heartbeat, markerTimer, historyTimer
+local pending, heartbeat, markerTimer, historyTimer, closeCommitTimer, inspectRetryTimer
+local pendingClosed = {}
+local lastInspectedUnknownKey = ""
 local sync, rememberWidth
 
 local function selectedTab(cx)
@@ -26,9 +29,10 @@ local function selectedTab(cx)
     return pane and cx.session:tab_of(pane)
 end
 
-local function requestUpdate(checkHidden)
+local function requestUpdate(checkHidden, delayMs)
     if not initialized or pending or (not shown and checkHidden ~= true) then return end
-    pending = tern.timer(30, function(cx)
+    local waitMs = if type(delayMs) == "number" then delayMs else 30
+    pending = tern.timer(waitMs, function(cx)
         pending = nil
         sync(cx)
     end)
@@ -55,6 +59,8 @@ local function tick()
         if shown then
             roots = tern.kv.get("project-folders") or {}
             indicators.motion(tern.kv.get("running-breathing") == true)
+            tabstate.refreshPins()
+            ordering.refreshPrefs()
             history.refreshArchive()
             sync(cx)
             tick()
@@ -69,32 +75,30 @@ local function nativeTabs(compact)
     end
 end
 
-local function savePinned()
-    tern.kv.set(stateKey .. ":pinned", if next(pinned) then pinned else nil)
+local function refreshSessionFiles(cx)
+    if unloading then return end
+    tabstate.inspectSessions(cx:window_key(), function(current)
+        if not unloading and shown and current then sync(current) end
+    end)
 end
 
 local function initialize(cx)
     if initialized then return end
+    unloading = false
+    lastInspectedUnknownKey = ""
     local key = cx:window_key()
     stateKey = "window:" .. key
     ownerNote = "Project tab navigation (" .. key .. ")"
     shown = tern.kv.get(stateKey .. ":visible") ~= false
     local saved = tern.kv.get(stateKey .. ":folded")
     if type(saved) == "table" then folded = saved end
-    local savedPinned = tern.kv.get(stateKey .. ":pinned")
-    if type(savedPinned) == "table" then
-        for id, order in savedPinned do
-            if type(id) == "string" and type(order) == "number" then
-                pinned[id] = order
-                if order > pinSeq then pinSeq = order end
-            end
-        end
-    end
     local savedWidth = tern.kv.get(stateKey .. ":width")
     if type(savedWidth) == "number" and savedWidth > 0 and savedWidth < 1 then width = savedWidth end
     roots = tern.kv.get("project-folders") or {}
     indicators.motion(tern.kv.get("running-breathing") == true)
-    activity.reconcile(cx, cx.session:panes())
+    tabstate.initPins(stateKey)
+    ordering.init(stateKey, cx.session:tabs())
+    activity.reconcile(cx, cx.session:panes(), false)
     initialized = true
 end
 
@@ -143,10 +147,13 @@ local function setVisible(cx, visible)
     tern.kv.set(stateKey .. ":visible", visible)
     if visible then
         indicators.motion(tern.kv.get("running-breathing") == true)
+        tabstate.refreshPins()
+        ordering.refreshPrefs()
         sync(cx)
         tick()
     else
         history.collapse()
+        ordering.closePopover()
         if pending then pending:cancel(); pending = nil end
         if heartbeat then heartbeat:cancel(); heartbeat = nil end
         dropPanel(cx)
@@ -154,10 +161,13 @@ local function setVisible(cx, visible)
 end
 
 local function tabPanes(cx, active, owners)
-    local byId, first, terminals = {}, {}, {}
+    local byId, first, terminals, sessionFiles = {}, {}, {}, {}
     local awaitingPanel = false
     local panes = cx.session:panes()
-    activity.reconcile(cx, panes)
+    local interacted = activity.reconcile(cx, panes, initialized)
+    if interacted then
+        for tabId in interacted do ordering.onInteraction(tabId) end
+    end
     for _, pane in panes do
         -- The title is only a hint to wait. Closing a pane requires the owner and window tag above.
         if pane.block == "tern.canvas" and not owners[pane.pane] and pane.title == title then
@@ -165,12 +175,14 @@ local function tabPanes(cx, active, owners)
         elseif pane.tab and pane.pane ~= panel and owners[pane.pane] ~= "project-tabs" and not pane.parked then
             byId[pane.pane] = pane
             if pane.kind == "terminal" or pane.kind == "agent" then terminals[pane.tab] = true end
+            local sf = tabstate.sessionFileForPane(pane.pane)
+            if sf and not sessionFiles[pane.tab] then sessionFiles[pane.tab] = sf end
             if not first[pane.tab] or (first[pane.tab].floating and not pane.floating) then
                 first[pane.tab] = pane
             end
         end
     end
-    return byId, first, awaitingPanel, terminals
+    return byId, first, awaitingPanel, terminals, sessionFiles
 end
 
 -- .git is a directory in a checkout and a file in a linked worktree. Cache all ancestors
@@ -206,11 +218,14 @@ end
 
 local function collect(cx, active)
     local owners = reconcilePanels(cx, active)
-    local panes, first, awaitingPanel, terminals = tabPanes(cx, active, owners)
-    local groups, byKey, liveTabs = {}, {}, {}
-    local hosts, sessions = {}, {}
+    local panes, first, awaitingPanel, terminals, sessionFiles = tabPanes(cx, active, owners)
+    local groups, byKey, liveTabs, liveTabList = {}, {}, {}, {}
+    local hosts, sessions, hasConnectingHost = {}, {}, false
     for _, host in cx.hosts:list() do
         if host.kind == "remote" then
+            if host.state == "connecting" or host.state == "reconnecting" or host.state == "stalled" then
+                hasConnectingHost = true
+            end
             for _, id in host.sessions do hosts[id] = host.address or host.name end
         end
     end
@@ -239,22 +254,49 @@ local function collect(cx, active)
                 byKey[key] = group
                 table.insert(groups, group)
             end
-            table.insert(group.tabs, { id = tab.id, pane = p.pane, session = tab.session,
+            local entry = {
+                id = tab.id, pane = p.pane, session = tab.session,
+                sessionName = sessions[tab.session] or "",
+                host = remote or "",
+                projectKey = key,
+                position = tab.position,
+                rawName = if tab.name and tab.name ~= "" then tab.name else "",
                 canArchive = not remote and terminals[tab.id] == true,
-                label = projects.label(p, tab), kind = p.kind, path = p.path or p.cwd or "" })
+                label = projects.label(p, tab),
+                kind = p.kind,
+                path = p.path or p.cwd or "",
+                normPath = p.path or p.cwd or p.url or "",
+                sessionFile = tabstate.sessionFileForPane(p.pane) or sessionFiles[tab.id] or "",
+            }
+            table.insert(group.tabs, entry)
+            table.insert(liveTabList, entry)
         end
     end
     remembered = liveTabs
-    if next(liveTabs) ~= nil then
-        local pruned = false
-        for idKey in pinned do
-            local numeric = tonumber(idKey)
-            if not numeric or not liveTabs[numeric] then
-                pinned[idKey] = nil
-                pruned = true
+    local needPinInspect = tabstate.reconcilePins(liveTabList, hasConnectingHost)
+    local needOrderInspect = ordering.reconcileTabs(liveTabList, hasConnectingHost)
+    if (needPinInspect or needOrderInspect) and not unloading then
+        -- Gate subprocess inspect by the exact set of unidentified local terminal/agent panes so
+        -- unmatched dormant records never cause periodic tern.com spawns on heartbeats/events.
+        local unknownIds = {}
+        for _, entry in liveTabList do
+            if entry.canArchive and entry.sessionFile == "" then
+                table.insert(unknownIds, tostring(entry.pane))
             end
         end
-        if pruned then savePinned() end
+        if #unknownIds > 0 then
+            table.sort(unknownIds)
+            local unknownKey = table.concat(unknownIds, ",")
+            if unknownKey ~= lastInspectedUnknownKey then
+                lastInspectedUnknownKey = unknownKey
+                refreshSessionFiles(cx)
+                if inspectRetryTimer then inspectRetryTimer:cancel() end
+                inspectRetryTimer = tern.timer(2500, function(current)
+                    inspectRetryTimer = nil
+                    if not unloading and shown then refreshSessionFiles(current) end
+                end)
+            end
+        end
     end
     activity.prune(liveTabs)
     table.sort(groups, function(a, b)
@@ -278,11 +320,14 @@ end
 
 local function menuItems(key, isTab)
     if isTab then
-        local items = {
-            { id = "rename-" .. key, label = "重命名标签", icon = "pen" },
-            { id = "close-" .. key, label = "关闭标签", icon = "x" },
-        }
-        if targets[key] and targets[key].canArchive then
+        local target = targets[key]
+        local items = {}
+        if target and target.pinKind == "auto" then
+            table.insert(items, { id = "dismiss-" .. key, label = "移回原项目", icon = "folder" })
+        end
+        table.insert(items, { id = "rename-" .. key, label = "重命名标签", icon = "pen" })
+        table.insert(items, { id = "close-" .. key, label = "关闭标签", icon = "x" })
+        if target and target.canArchive then
             table.insert(items, { id = "archive-" .. key, label = "关闭并移出历史", icon = "trash", danger = true })
         end
         return items
@@ -313,7 +358,7 @@ end
 local function paintHistory(cx)
     if lastHistoryRevision == history.revision then return end
     -- The native picker keeps row actions reachable at the edge of the scrolling card.
-    cx.canvas:set(panel, {set = {history = history.view(actionMenu)}})
+    cx.canvas:set(panel, {set = {["topbar.history"] = history.view(actionMenu)}})
     lastHistoryRevision = history.revision
 end
 
@@ -331,8 +376,11 @@ end
 
 local function describe(groups, active)
     local clicks, folds, membership, signature = {}, {}, {}, {}
+    table.insert(signature, ordering.signature())
     projects.labelGroups(groups)
-    local pinnedTabs, visibleGroups = {}, {}
+    local pinned = tabstate.pinnedMap()
+    local autoPinnedTabs, autoPinnedSet = ordering.selectAutoPinned(groups, pinned)
+    local manualPinnedTabs, visibleGroups = {}, {}
     for _, g in groups do
         local rest = {}
         for _, tab in g.tabs do
@@ -341,39 +389,50 @@ local function describe(groups, active)
             local order = pinned[tostring(tab.id)]
             if order then
                 tab.pinned = true
+                tab.pinKind = "manual"
                 tab.pinOrder = order
-                table.insert(pinnedTabs, tab)
+                table.insert(manualPinnedTabs, tab)
+            elseif autoPinnedSet[tab.id] then
+                tab.pinned = true
+                tab.pinKind = "auto"
+                tab.pinOrder = nil
             else
                 tab.pinned = false
+                tab.pinKind = nil
                 table.insert(rest, tab)
             end
         end
         if #rest > 0 then
+            ordering.sortGroupTabs(rest)
             g.tabs = rest
             table.insert(visibleGroups, g)
         end
     end
-    table.sort(pinnedTabs, function(a, b)
+    table.sort(manualPinnedTabs, function(a, b)
         if a.pinOrder == b.pinOrder then return a.id < b.id end
         return a.pinOrder > b.pinOrder
     end)
+    local allPinnedTabs = {}
+    for _, tab in manualPinnedTabs do table.insert(allPinnedTabs, tab) end
+    for _, tab in autoPinnedTabs do table.insert(allPinnedTabs, tab) end
     local pinnedGroup
-    if #pinnedTabs > 0 then
+    if #allPinnedTabs > 0 then
         pinnedGroup = {
             id = "pinned", key = pinnedFoldKey, name = "置顶", label = "置顶",
-            tabs = pinnedTabs, closed = folded[pinnedFoldKey] == true, pinned = true,
+            tabs = allPinnedTabs, manualTabs = manualPinnedTabs, autoTabs = autoPinnedTabs,
+            closed = folded[pinnedFoldKey] == true, pinned = true,
         }
         folds[pinnedGroup.id] = pinnedGroup
-        table.insert(signature, { pinnedGroup.key, #pinnedTabs, pinnedGroup.closed })
-        for _, tab in pinnedTabs do
+        table.insert(signature, { pinnedGroup.key, #manualPinnedTabs, #autoPinnedTabs, pinnedGroup.closed })
+        for _, tab in allPinnedTabs do
             membership[tab.id] = pinnedGroup
             if pinnedGroup.closed then
-                table.insert(signature, tab.id)
+                table.insert(signature, { tab.id, tab.pinKind })
             else
                 tab.button = "t" .. tostring(tab.id)
                 tab.current = active == tab.id
                 clicks[tab.button] = tab
-                table.insert(signature, { tab.button, tab.label, tab.projectLabel, tab.path, tab.kind or "", tab.current, tab.canArchive, true })
+                table.insert(signature, { tab.button, tab.label, tab.projectLabel, tab.path, tab.kind or "", tab.current, tab.canArchive, tab.pinKind })
             end
         end
     end
@@ -397,8 +456,13 @@ local function describe(groups, active)
     return tern.json.encode(signature), pinnedGroup, visibleGroups
 end
 
-local function tabRow(tab, anchored, isPinned)
-    local tip = if isPinned then
+local function tabRow(tab, anchored, pinKind)
+    local isPinned = pinKind ~= nil
+    local isManual = pinKind == "manual"
+    local isAuto = pinKind == "auto"
+    local tip = if isAuto then
+        tab.label .. "\n" .. tab.projectLabel .. " · 最近交互自动置顶" .. (if tab.path == "" then "" else "\n" .. tab.path)
+    elseif isManual then
         tab.label .. "\n" .. tab.projectLabel .. (if tab.path == "" then "" else "\n" .. tab.path)
     elseif tab.path == "" then tab.label
     else tab.label .. "\n" .. tab.path
@@ -408,11 +472,12 @@ local function tabRow(tab, anchored, isPinned)
         title = tip,
         actions = { click = tab.button },
     })
+    local pinTitle = if isManual then "取消置顶" elseif isAuto then "固定置顶" else "置顶标签"
     local pinBtn = ui.button("", {
         key = "pin", role = "pt-pin", icon = "pin", size = "sm", variant = "quiet",
-        on = isPinned,
-        title = if isPinned then "取消置顶" else "置顶标签",
-        aria = (if isPinned then "取消置顶" else "置顶标签") .. "「" .. tab.label .. "」",
+        on = isManual,
+        title = pinTitle,
+        aria = pinTitle .. "「" .. tab.label .. "」",
         actions = { click = "pin-" .. tab.button },
     })
     local actions = ui.el("div", { key = "actions", class = "pt-row-actions" }, {
@@ -421,31 +486,51 @@ local function tabRow(tab, anchored, isPinned)
     })
     local className = "pt-tab"
     if isPinned then className ..= " pt-pinned" end
+    if isAuto then className ..= " pt-auto-pinned" end
     if tab.current then className ..= " pt-current" end
     return row(className, tab.button, button, actions, indicators.tab(tab.id))
 end
 
 local function render(pinnedGroup, groups, anchored)
-    local nodes = {history.view(actionMenu)}
+    local topbar = ui.el("div", { key = "topbar", class = "pt-topbar" }, {
+        history.view(actionMenu),
+        ordering.trigger(),
+    })
+    local nodes = { topbar }
+    local popover = ordering.popover()
+    if popover then table.insert(nodes, popover) end
     indicators.reset()
     if pinnedGroup then
         local count = tostring(#pinnedGroup.tabs)
+        local autoOnly = #pinnedGroup.manualTabs == 0 and #pinnedGroup.autoTabs > 0
+        local headChildren = {
+            ui.el("span", { class = "pt-group-caret", text = if pinnedGroup.closed then "▸" else "▾" }),
+            ui.el("span", { class = "pt-group-name", text = "置顶" }),
+        }
+        if autoOnly then
+            table.insert(headChildren, ui.el("span", { class = "pt-pinned-tag", text = "最近" }))
+        end
+        table.insert(headChildren, ui.el("span", { class = "pt-group-count", text = count }))
         local heading = ui.el("button", {
             key = "fold", class = "pt-group-btn pt-pinned-btn",
-            title = "展开或收起已置顶的标签",
+            title = if autoOnly then "展开或收起最近交互自动置顶的标签" else "展开或收起已置顶的标签",
             aria = "置顶，" .. count .. " 个标签",
             attrs = { ["aria-expanded"] = tostring(not pinnedGroup.closed) },
             actions = { click = pinnedGroup.id },
-        }, {
-            ui.el("span", { class = "pt-group-caret", text = if pinnedGroup.closed then "▸" else "▾" }),
-            ui.el("span", { class = "pt-group-name", text = "置顶" }),
-            ui.el("span", { class = "pt-group-count", text = count }),
-        })
+        }, headChildren)
         table.insert(nodes, row(if pinnedGroup.closed then "pt-group pt-pinned-group pt-group-closed" else "pt-group pt-pinned-group",
             pinnedGroup.id, heading, nil, if pinnedGroup.closed then indicators.group(pinnedGroup) else nil))
         if not pinnedGroup.closed then
-            for _, tab in pinnedGroup.tabs do
-                table.insert(nodes, tabRow(tab, anchored, true))
+            for _, tab in pinnedGroup.manualTabs do
+                table.insert(nodes, tabRow(tab, anchored, "manual"))
+            end
+            if #pinnedGroup.manualTabs > 0 and #pinnedGroup.autoTabs > 0 then
+                table.insert(nodes, ui.el("div", { key = "pinned-subsep", class = "pt-pinned-subsep" }, {
+                    ui.el("span", { class = "pt-pinned-subsep-label", text = "最近交互" }),
+                }))
+            end
+            for _, tab in pinnedGroup.autoTabs do
+                table.insert(nodes, tabRow(tab, anchored, "auto"))
             end
         end
         if #groups > 0 then
@@ -471,7 +556,7 @@ local function render(pinnedGroup, groups, anchored)
             if g.closed then indicators.group(g) else nil))
         if not g.closed then
             for _, tab in g.tabs do
-                table.insert(nodes, tabRow(tab, anchored, false))
+                table.insert(nodes, tabRow(tab, anchored, nil))
             end
         end
     end
@@ -638,10 +723,15 @@ local function closeTab(cx, tab)
     if not focusTab(cx, tab) then requestUpdate(); return end
     -- Native Close Tab applies to the focused tab and owns its confirmation and cancellation.
     cx:command("close_tab")
-    if not cx.session:layout(tab.id) and previousTab and previousTab ~= tab.id
-        and cx.session:tab_of(previous) == previousTab then
-        if cx.sessions:current().id ~= previousSession then cx.sessions:switch(previousSession) end
-        cx.layout:focus(previous)
+    if not cx.session:layout(tab.id) then
+        pendingClosed[tab.id] = nil
+        tabstate.removeClosedTab(tab.id)
+        ordering.onTabClosed(tab.id)
+        if previousTab and previousTab ~= tab.id
+            and cx.session:tab_of(previous) == previousTab then
+            if cx.sessions:current().id ~= previousSession then cx.sessions:switch(previousSession) end
+            cx.layout:focus(previous)
+        end
     end
     sync(cx)
 end
@@ -720,22 +810,37 @@ end
 local function togglePin(cx, key)
     local tab = targets[key]
     if not tab then return end
-    local idKey = tostring(tab.id)
-    if pinned[idKey] then
-        pinned[idKey] = nil
+    if tabstate.isPinned(tab.id) then
+        tabstate.unpinTab(tab.id)
+        -- Keep an unpinned tab in its project until its next interaction.
+        ordering.suppressAutoPin(tab.id)
         if tab.projectKey and folded[tab.projectKey] then
             folded[tab.projectKey] = nil
             tern.kv.set(stateKey .. ":folded", folded)
         end
     else
-        pinSeq += 1
-        pinned[idKey] = pinSeq
+        tabstate.pinTab(tab)
+        ordering.clearSuppression(tab.id)
+        if tab.canArchive and (not tab.sessionFile or tab.sessionFile == "") then
+            refreshSessionFiles(cx)
+        end
         if folded[pinnedFoldKey] then
             folded[pinnedFoldKey] = nil
             tern.kv.set(stateKey .. ":folded", folded)
         end
     end
-    savePinned()
+    if lastContent and cx.session:pane(lastContent) then cx.layout:focus(lastContent) end
+    sync(cx)
+end
+
+local function dismissAutoPin(cx, key)
+    local tab = targets[key]
+    if not tab then return end
+    ordering.suppressAutoPin(tab.id)
+    if tab.projectKey and folded[tab.projectKey] then
+        folded[tab.projectKey] = nil
+        tern.kv.set(stateKey .. ":folded", folded)
+    end
     if lastContent and cx.session:pane(lastContent) then cx.layout:focus(lastContent) end
     sync(cx)
 end
@@ -744,6 +849,8 @@ local function runRowAction(cx, act)
     local verb, key = act:match("^(%a+)%-(.+)$")
     if verb == "pin" then
         togglePin(cx, key)
+    elseif verb == "dismiss" then
+        dismissAutoPin(cx, key)
     elseif verb == "new" then
         newConversation(cx, key)
     elseif verb == "rename" then
@@ -809,10 +916,31 @@ local function removeFolder(cx)
     end)
 end
 
+local function chooseSortMode(cx)
+    initialize(cx)
+    ordering.chooseSortMode(cx, function(current)
+        if shown then sync(current) end
+    end)
+end
+
+local function chooseAutoPin(cx)
+    initialize(cx)
+    ordering.chooseAutoPin(cx, function(current)
+        if shown then sync(current) end
+    end)
+end
+
+local function noteInteraction(tabId)
+    if not initialized or not tabId then return end
+    if ordering.onInteraction(tabId) then requestUpdate() end
+end
+
 tern.command({ id = "toggle", title = "显示 / 隐藏项目标签栏", group = "项目标签",
     icon = "folder", keys = { "alt+f9" }, run = toggle })
 tern.command({ id = "add-folder", title = "添加项目根目录…", group = "项目标签", icon = "folder", run = addFolder })
 tern.command({ id = "remove-folder", title = "移除自定义项目根目录…", group = "项目标签", icon = "folder", run = removeFolder })
+tern.command({ id = "sort-mode", title = "设置标签排序模式…", group = "项目标签", run = chooseSortMode })
+tern.command({ id = "auto-pin-recent", title = "设置最近交互自动放置顶…", group = "项目标签", run = chooseAutoPin })
 tern.command({ id = "running-indicator", title = "设置运行绿点…", group = "项目标签", run = chooseMotion })
 tern.files.button({ id = "projects", title = "显示 / 隐藏项目标签栏", icon = "folder",
     run = function(_, cx) toggle(cx) end })
@@ -822,6 +950,14 @@ end)
 
 tern.on("canvas_action", function(ev, cx)
     if ev.pane ~= panel then return false end
+    if ev.act == "history-toggle" and ordering.closePopover() then
+        sync(cx)
+    end
+    if ordering.handle(ev.act, function() history.collapse() end) then
+        if lastContent and cx.session:pane(lastContent) then cx.layout:focus(lastContent) end
+        sync(cx)
+        return true
+    end
     if history.handle(cx, ev.act, requestHistoryUpdate, historySession, revealHistory) then
         paintHistory(cx)
         return true
@@ -866,35 +1002,77 @@ tern.on("focus", function(ev, cx)
     if initialized then requestUpdate(true) else start(cx) end
 end)
 tern.on("command_started", function(ev, cx)
-    activity.shell(cx.session:pane(ev.pane), false)
+    local pane = cx.session:pane(ev.pane)
+    if activity.shell(pane, false) and pane and pane.tab then noteInteraction(pane.tab) end
     requestMarkers()
 end)
 tern.on("command_finished", function(ev, cx)
-    activity.shell(cx.session:pane(ev.pane), true, selectedTab(cx))
+    local pane = cx.session:pane(ev.pane)
+    if activity.shell(pane, true, selectedTab(cx)) and pane and pane.tab then noteInteraction(pane.tab) end
     requestMarkers()
 end)
 tern.on("agent_state", function(ev, cx)
-    activity.agentChanged(ev.pane, cx.session:tab_of(ev.pane), ev.old, ev.new, selectedTab(cx))
+    local tab = cx.session:tab_of(ev.pane)
+    if activity.agentChanged(ev.pane, tab, ev.old, ev.new, selectedTab(cx)) and tab then noteInteraction(tab) end
     requestMarkers()
 end)
 tern.on("agent_finished", function(ev, cx)
-    activity.agentFinished(ev.pane, cx.session:tab_of(ev.pane), ev.result, selectedTab(cx))
+    local tab = cx.session:tab_of(ev.pane)
+    if activity.agentFinished(ev.pane, tab, ev.result, selectedTab(cx)) and tab then noteInteraction(tab) end
     requestMarkers()
 end)
-for _, event in { "cwd", "title", "tab_created", "pane_created", "session_ended" } do
-    tern.on(event, requestUpdate)
+tern.on("tab_created", function(ev)
+    if initialized then ordering.onTabCreated(ev.tab) end
+    requestUpdate()
+end)
+tern.on("title", function(ev, cx)
+    if not initialized or not shown then return end
+    local tabId = cx.session:tab_of(ev.pane)
+    if tabId then
+        local group = groupByTab[tabId]
+        if group and group.closed then return end
+        local target = targets["t" .. tostring(tabId)]
+        if target and target.rawName ~= "" then return end
+    end
+    requestUpdate(false, 120)
+end)
+for _, event in { "cwd", "pane_created", "session_ended" } do
+    tern.on(event, function() requestUpdate() end)
 end
+local function scheduleClosedCleanup()
+    if closeCommitTimer then closeCommitTimer:cancel() end
+    -- Delay persisting tab_closed removals so Tern shutdown / Stop Sessions and Quit
+    -- never wipes pinned tabs or tab order before unload cancels this timer.
+    closeCommitTimer = tern.timer(700, function(cx)
+        closeCommitTimer = nil
+        if unloading then pendingClosed = {}; return end
+        local remaining = cx.session:tabs()
+        if #remaining == 0 then pendingClosed = {}; return end
+        local stillLive = {}
+        for _, t in remaining do stillLive[t.id] = true end
+        local removedAny = false
+        for tabId in pendingClosed do
+            if not stillLive[tabId] then
+                if tabstate.removeClosedTab(tabId) then removedAny = true end
+                if ordering.onTabClosed(tabId) then removedAny = true end
+            end
+        end
+        pendingClosed = {}
+        if removedAny and shown then requestUpdate() end
+    end)
+end
+
 tern.on("tab_closed", function(ev)
     activity.removeTab(ev.tab)
-    local idKey = tostring(ev.tab)
-    if pinned[idKey] then
-        pinned[idKey] = nil
-        savePinned()
+    if not unloading then
+        pendingClosed[ev.tab] = true
+        scheduleClosedCleanup()
     end
     requestUpdate()
 end)
 tern.on("pane_closed", function(ev, cx)
     history.closed(ev.pane)
+    tabstate.clearPane(ev.pane)
     activity.removePane(ev.pane)
     requestMarkers()
     if ev.pane == panel then
@@ -910,9 +1088,16 @@ tern.on("pane_closed", function(ev, cx)
     requestUpdate()
 end)
 tern.on("unload", function(cx)
+    unloading = true
     shown = false
+    pendingClosed = {}
+    if closeCommitTimer then closeCommitTimer:cancel(); closeCommitTimer = nil end
+    if inspectRetryTimer then inspectRetryTimer:cancel(); inspectRetryTimer = nil end
+    tabstate.flushPins()
+    ordering.flush()
     history.collapse()
-    if pending then pending:cancel() end
-    if heartbeat then heartbeat:cancel() end
+    ordering.closePopover()
+    if pending then pending:cancel(); pending = nil end
+    if heartbeat then heartbeat:cancel(); heartbeat = nil end
     dropPanel(cx)
 end)
